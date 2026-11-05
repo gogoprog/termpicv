@@ -30,6 +30,8 @@ class Ueberzug
     // `force` re-sends every placement (needed after the terminal was fully repainted).
     void sync(const Placements &desired, bool force = false);
     void clear();
+    // True while ueberzug still has unread commands waiting in its pipe.
+    bool busy() const;
 
   private:
     static constexpr int kMaxRestarts = 5;

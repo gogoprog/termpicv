@@ -4,6 +4,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
@@ -155,6 +156,13 @@ bool Ueberzug::alive()
         return false;
     }
     return true;
+}
+
+bool Ueberzug::busy() const
+{
+    // On Linux FIONREAD works on either end of a pipe and reports the unread bytes.
+    int pending = 0;
+    return fd_ >= 0 && ioctl(fd_, FIONREAD, &pending) == 0 && pending > 0;
 }
 
 void Ueberzug::sync(const Placements &desired, bool force)

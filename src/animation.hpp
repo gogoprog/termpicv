@@ -3,12 +3,14 @@
 #include "thumbnailer.hpp"
 
 #include <atomic>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
-// Decodes an animated image (gif, webp...) into cached, pre-scaled PNG frames in a background
-// thread, so ueberzug can be fed one frame after another.
+// Decodes an animated image (gif, webp...) into pre-scaled PNG frames in a background thread,
+// so ueberzug can be fed one frame after another. Frames become available as they are decoded,
+// and live in a temporary directory removed with the object.
 class Animation
 {
   public:
@@ -23,21 +25,22 @@ class Animation
     ~Animation();
 
     const std::string &path() const { return path_; }
-    // Once true, frames() is complete and no longer changes.
-    bool ready() const { return ready_; }
-    bool animated() const { return ready_ && frames_.size() > 1; }
-    const std::vector<Frame> &frames() const { return frames_; }
+    // True once every frame has been decoded (or decoding failed).
+    bool done() const { return done_; }
+    size_t frameCount();
+    Frame frame(size_t index);
 
     static bool canAnimate(const std::string &path);
 
   private:
     void run();
-    bool loadManifest(const std::string &manifest);
 
     std::string path_;
     int maxWidth_, maxHeight_;
+    std::string dir_;
+    std::mutex mutex_;
     std::vector<Frame> frames_;
-    std::atomic<bool> ready_{false};
+    std::atomic<bool> done_{false};
     std::atomic<bool> stop_{false};
     std::thread worker_;
 };

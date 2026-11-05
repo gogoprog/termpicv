@@ -1,11 +1,12 @@
 #include "animation.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
-#include <fstream>
 
 #ifdef TERMPICV_HAVE_MAGICK
 #include <Magick++.h>
+#include <png.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -16,6 +17,55 @@ namespace
 constexpr size_t kMaxFrames = 1000;
 // Browsers treat tiny GIF delays (0 or 1 tick) as 100ms; do the same.
 constexpr int kDefaultDelayMs = 100;
+
+std::string makeTempDir()
+{
+    fs::path base;
+    if (const char *runtime = getenv("XDG_RUNTIME_DIR"); runtime && *runtime)
+        base = runtime;
+    else
+        base = fs::temp_directory_path();
+    std::string tmpl = (base / "termpicv-XXXXXX").string();
+    if (!mkdtemp(tmpl.data()))
+        return {};
+    return tmpl;
+}
+
+#ifdef TERMPICV_HAVE_MAGICK
+// ImageMagick's PNG encoder analyses every frame's colors (~100ms for a typical GIF frame);
+// exporting the pixels and writing them with libpng, unfiltered at zlib level 1, takes a few ms.
+bool writeFastPng(const std::string &file, Magick::Image &img)
+{
+    const bool alpha = img.alpha();
+    const size_t w = img.columns(), h = img.rows(), channels = alpha ? 4 : 3;
+    std::vector<unsigned char> pixels(w * h * channels);
+    img.write(0, 0, w, h, alpha ? "RGBA" : "RGB", Magick::CharPixel, pixels.data());
+
+    FILE *fp = fopen(file.c_str(), "wb");
+    if (!fp)
+        return false;
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    png_infop info = png ? png_create_info_struct(png) : nullptr;
+    if (!info || setjmp(png_jmpbuf(png)))
+    {
+        png_destroy_write_struct(&png, &info);
+        fclose(fp);
+        return false;
+    }
+    png_init_io(png, fp);
+    png_set_compression_level(png, 1);
+    png_set_filter(png, 0, PNG_FILTER_NONE);
+    png_set_IHDR(png, info, static_cast<png_uint_32>(w), static_cast<png_uint_32>(h), 8,
+                 alpha ? PNG_COLOR_TYPE_RGBA : PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
+                 PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png, info);
+    for (size_t y = 0; y < h; ++y)
+        png_write_row(png, pixels.data() + y * w * channels);
+    png_write_end(png, nullptr);
+    png_destroy_write_struct(&png, &info);
+    return fclose(fp) == 0;
+}
+#endif
 
 } // namespace
 
@@ -41,40 +91,28 @@ Animation::~Animation()
     stop_ = true;
     if (worker_.joinable())
         worker_.join();
+    if (!dir_.empty())
+    {
+        std::error_code ec;
+        fs::remove_all(dir_, ec);
+    }
 }
 
-bool Animation::loadManifest(const std::string &manifest)
+size_t Animation::frameCount()
 {
-    std::ifstream in(manifest);
-    if (!in)
-        return false;
-    std::vector<Frame> frames;
-    Frame f;
-    while (in >> f.size.width >> f.size.height >> f.delayMs && std::getline(in >> std::ws, f.path))
-    {
-        if (!fs::exists(f.path))
-            return false;
-        frames.push_back(f);
-    }
-    if (frames.empty())
-        return false;
-    frames_ = std::move(frames);
-    return true;
+    std::lock_guard lock(mutex_);
+    return frames_.size();
+}
+
+Animation::Frame Animation::frame(size_t index)
+{
+    std::lock_guard lock(mutex_);
+    return index < frames_.size() ? frames_[index] : Frame{};
 }
 
 void Animation::run()
 {
 #ifdef TERMPICV_HAVE_MAGICK
-    const std::string geometry = std::to_string(maxWidth_) + "x" + std::to_string(maxHeight_);
-    const fs::path stem = fs::path(cacheDirectory()) / (cacheKey(path_, maxWidth_ * 100000 + maxHeight_) + "-anim");
-    const std::string manifest = stem.string() + ".txt";
-
-    if (loadManifest(manifest))
-    {
-        ready_ = true;
-        return;
-    }
-
     try
     {
         std::vector<Magick::Image> raw, frames;
@@ -83,49 +121,44 @@ void Animation::run()
             raw.resize(kMaxFrames);
         if (raw.size() <= 1 || stop_)
         {
-            ready_ = true; // still image: the viewer shows the original
+            done_ = true; // still image: the viewer shows the original
             return;
         }
         // Frames of a GIF are often partial updates; coalescing turns them into full images.
         Magick::coalesceImages(&frames, raw.begin(), raw.end());
         raw.clear();
 
-        std::vector<Frame> out;
-        for (size_t i = 0; i < frames.size(); ++i)
+        dir_ = makeTempDir();
+        if (dir_.empty())
         {
-            if (stop_)
-                return;
-            Magick::Image &img = frames[i];
-            Magick::Geometry g(geometry);
-            g.greater(true); // only shrink
-            img.resize(g);
-            img.magick("PNG");
-            img.quality(10); // fast zlib level, these are throwaway cache files
+            done_ = true;
+            return;
+        }
 
-            const std::string file = stem.string() + "-" + std::to_string(i) + ".png";
-            img.write(file);
+        Magick::Geometry bounds(static_cast<size_t>(maxWidth_), static_cast<size_t>(maxHeight_));
+        bounds.greater(true); // only shrink
+        for (size_t i = 0; i < frames.size() && !stop_; ++i)
+        {
+            Magick::Image &img = frames[i];
+            img.resize(bounds);
+
+            const std::string file = dir_ + "/" + std::to_string(i) + ".png";
+            if (!writeFastPng(file, img))
+                break;
 
             // animationDelay() is in 1/100 s ticks (Magick++ doesn't expose ticks_per_second).
             int delay = static_cast<int>(img.animationDelay() * 10);
             if (delay < 20)
                 delay = kDefaultDelayMs;
-            out.push_back({file, {static_cast<int>(img.columns()), static_cast<int>(img.rows())}, delay});
-        }
 
-        // Manifest last, via rename, so a partial decode is never reused.
-        const std::string tmp = manifest + ".tmp";
-        {
-            std::ofstream mf(tmp);
-            for (const auto &f : out)
-                mf << f.size.width << ' ' << f.size.height << ' ' << f.delayMs << ' ' << f.path << '\n';
+            std::lock_guard lock(mutex_);
+            frames_.push_back({file, {static_cast<int>(img.columns()), static_cast<int>(img.rows())}, delay});
         }
-        fs::rename(tmp, manifest);
-        frames_ = std::move(out);
     }
     catch (const std::exception &)
     {
-        frames_.clear();
+        // Keep whatever frames were decoded.
     }
 #endif
-    ready_ = true;
+    done_ = true;
 }

@@ -113,7 +113,9 @@ int App::run()
         bool changed = false;
         if (ch == ERR)
         {
-            changed = thumbs_->takeDirty() | tickAnimation();
+            const bool thumbsChanged = thumbs_->takeDirty();
+            const bool frameChanged = tickAnimation();
+            changed = thumbsChanged || frameChanged;
         }
         else if (ch == KEY_RESIZE || ch == 12 /* ^L */)
         {
@@ -139,10 +141,11 @@ int App::inputTimeoutMs() const
     if (!anim_)
         return 100;
     if (!animStarted_ || animPaused_)
-        return 30; // waiting for decoding to finish
+        return 30; // waiting for the first frames
     const auto ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(nextFrame_ - std::chrono::steady_clock::now()).count();
-    return static_cast<int>(std::clamp<long>(ms, 1, 100));
+    // When overdue (ueberzug busy, or waiting for the decoder), poll gently rather than spin.
+    return static_cast<int>(std::clamp<long>(ms, 5, 100));
 }
 
 void App::updateAnimation()
@@ -171,26 +174,46 @@ void App::updateAnimation()
 
 bool App::tickAnimation()
 {
-    if (!anim_ || !anim_->ready())
+    using namespace std::chrono;
+    if (!anim_)
         return false;
-    if (!anim_->animated())
+    const size_t count = anim_->frameCount();
+    if (count < 2) // still decoding the first frames, or not animated at all
         return false;
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = steady_clock::now();
     if (!animStarted_)
     {
-        // Decoding just finished: show the first frame.
         animStarted_ = true;
         frame_ = 0;
-        nextFrame_ = now + std::chrono::milliseconds(anim_->frames()[0].delayMs);
+        nextFrame_ = now + milliseconds(anim_->frame(0).delayMs);
         return true;
     }
     if (animPaused_ || now < nextFrame_)
         return false;
-    const auto &frames = anim_->frames();
-    frame_ = (frame_ + 1) % frames.size();
-    nextFrame_ += std::chrono::milliseconds(frames[frame_].delayMs);
-    if (nextFrame_ < now) // fell behind (slow draw): don't try to catch up
-        nextFrame_ = now + std::chrono::milliseconds(frames[frame_].delayMs);
+    // ueberzug hasn't picked up the previous frame yet: sending more would only queue up lag.
+    if (ueberzug_.busy())
+        return false;
+
+    // Jump to the frame due now, skipping the ones we were too slow to show.
+    const bool complete = anim_->done();
+    size_t next = frame_;
+    while (nextFrame_ <= now)
+    {
+        size_t candidate = next + 1;
+        if (candidate >= count)
+        {
+            if (!complete)
+                break; // caught up with the decoder
+            candidate = 0;
+        }
+        next = candidate;
+        nextFrame_ += milliseconds(anim_->frame(next).delayMs);
+    }
+    if (now - nextFrame_ > seconds(1))
+        nextFrame_ = now;
+    if (next == frame_)
+        return false;
+    frame_ = next;
     return true;
 }
 
@@ -354,16 +377,17 @@ void App::renderViewer(Placements &placements)
     ImageSize shownSize = size;
     if (anim_)
     {
-        if (!anim_->ready())
-            info = "decoding…  " + info;
-        else if (anim_->animated() && animStarted_)
+        const size_t count = anim_->frameCount();
+        if (animStarted_)
         {
-            const auto &f = anim_->frames()[frame_];
+            const Animation::Frame f = anim_->frame(frame_);
             shown = f.path;
             shownSize = f.size;
-            info = (animPaused_ ? "paused " : "") + std::to_string(frame_ + 1) + "/" +
-                   std::to_string(anim_->frames().size()) + " frames  " + info;
+            info = (animPaused_ ? "paused " : "") + std::to_string(frame_ + 1) + "/" + std::to_string(count) +
+                   (anim_->done() ? "" : "…") + " frames  " + info;
         }
+        else if (!anim_->done())
+            info = "decoding…  " + info;
     }
     info += std::to_string(selected_ + 1) + "/" + std::to_string(files_.size());
 
@@ -442,7 +466,7 @@ bool App::handleViewerKey(int ch)
         mode_ = Mode::Grid;
         return true;
     case 'a':
-        if (!anim_ || !anim_->animated())
+        if (!anim_ || anim_->frameCount() < 2)
             return false;
         animPaused_ = !animPaused_;
         if (!animPaused_)
