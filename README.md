@@ -93,3 +93,7 @@ termpicv photo.jpg           # open photo.jpg in the viewer, with the rest of it
 
 Animation frames are written to a temporary directory under `$XDG_RUNTIME_DIR` (or `/tmp`), which is deleted
 when you leave the image.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
