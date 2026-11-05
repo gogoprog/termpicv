@@ -3,6 +3,8 @@
 A terminal image browser: a thumbnail grid and a full-screen viewer, drawn with ncurses, with the images
 displayed by [ueberzug](https://github.com/ueberzug/ueberzug) or [ueberzugpp](https://github.com/jstkdng/ueberzugpp).
 
+![termpicv demo: browsing thumbnails, resizing them, viewing photos and playing an animated GIF](docs/demo.gif)
+
 ## Features
 
 - **Thumbnail grid** with filenames and a highlighted selection, centered in the terminal; six thumbnail sizes.
